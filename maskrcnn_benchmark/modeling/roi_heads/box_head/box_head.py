@@ -47,12 +47,19 @@ class ROIBoxHead(torch.nn.Module):
             with torch.no_grad():
                 proposals = self.loss_evaluator.subsample(proposals, targets)
 
+
+        ### xc, aug, xr分别是classifier1用的feature、classifier2用的feature、regressor用的feature
         # extract features that will be fed to the final classifier. The
         # feature_extractor generally corresponds to the pooler + heads
-        xc, aug, xr = self.feature_extractor(features, proposals, centroid)
-        # final classifier that converts the features into predictions
+        xc, aug, xr = self.feature_extractor(features, proposals, centroid) # 调用FPN2MLPFeatureExtractor
+        
+        
+        ## classifier1和regressor
         class_logits, box_regression = self.predictor(xc, xr)
+        ## classifier2
         aug_logits, _ = self.predictor(aug, xr)
+
+        ## KL loss
         kl_loss = self.kl_categorical(class_logits, aug_logits)
         if closeup_features is not None:
             closeup_xc = self.feature_extractor(closeup_features, center=centroid)

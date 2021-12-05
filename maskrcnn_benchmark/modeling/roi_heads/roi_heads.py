@@ -23,8 +23,14 @@ class CombinedROIHeads(torch.nn.ModuleDict):
     def forward(self, features, centroid, proposals, targets=None, closeup_features=None, closeup_targets=None):
         losses = {}
         # TODO rename x to roi_box_features, if it doesn't increase memory consumption
+        
+        
+        ## Box Branch
         x, detections, loss_box = self.box(features, proposals, centroid, targets, closeup_features, closeup_targets)
         losses.update(loss_box)
+        
+
+        ## Mask Branch
         if self.cfg.MODEL.MASK_ON:
             mask_features = features
             # optimization: during training, if we share the feature extractor between
@@ -39,6 +45,8 @@ class CombinedROIHeads(torch.nn.ModuleDict):
             x, detections, loss_mask = self.mask(mask_features, detections, targets)
             losses.update(loss_mask)
 
+
+        ## Keypoint Branch
         if self.cfg.MODEL.KEYPOINT_ON:
             keypoint_features = features
             # optimization: during training, if we share the feature extractor between

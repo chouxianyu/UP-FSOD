@@ -49,6 +49,9 @@ class FPNPredictor(nn.Module):
             nn.init.constant_(l.bias, 0)
 
     def forward(self, xc, xr=None):
+        ## IMPORTANT: ROIBoxHead会调用该函数
+
+
         #if x.ndimension() == 4:
         #    assert list(x.shape[2:]) == [1, 1]
         #    x = x.view(x.size(0), -1)

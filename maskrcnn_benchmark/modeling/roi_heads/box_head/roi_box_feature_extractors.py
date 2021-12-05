@@ -75,12 +75,13 @@ class FPN2MLPFeatureExtractor(nn.Module):
         self.out_channels = representation_size
 
         self.netup = torch.nn.Sequential(
-            torch.nn.Conv2d(256, 24, 3, padding=1)
+            torch.nn.Conv2d(256, 24, 3, padding=1) # 输入为C=256通道，输出D=24通道
             )
-        #self.centroids = torch.nn.Parameter(torch.rand(24, 256))
+        ## transformation: 将UP转为CP(conditional prototype)
         self.alpha = torch.nn.Parameter(torch.rand(24, 1))
         self.beta = torch.nn.Parameter(torch.rand(24, 1))
-        self.num_cluster = 24
+
+        self.num_cluster = 24 # D=24个prototype
         self.upfc = make_fc(24*256, 512, use_gn)
         self.encode = torch.nn.Conv1d(256, 256, kernel_size=1)
 
@@ -92,60 +93,99 @@ class FPN2MLPFeatureExtractor(nn.Module):
             )
 
     def UP(self, scene, center):
-        x = scene
+        # 该函数类似于GeneralizedRCNN中的函数UP()
+
+
+        ## P
+        x = scene # (N, C, w, h)
         N, C, W, H = x.shape[0:]
-
         x = F.normalize(x, p=2, dim=1)
-        soft_assign = self.netup(x)
 
-        soft_assign = F.softmax(soft_assign, dim=1)
-        soft_assign = soft_assign.view(soft_assign.shape[0], soft_assign.shape[1], -1)
-
-        x_flatten = x.view(N, C, -1)
-
-        #centroid = self.centroids
+        ## transformation: 将UP转为CP(conditional prototype)
         centroid = self.alpha * center + self.beta
 
-        x1 = x_flatten.expand(self.num_cluster, -1, -1, -1).permute(1, 0, 2, 3)
-        x2 = centroid.expand(x_flatten.size(-1), -1, -1).permute(1, 2, 0).unsqueeze(0)
+        ## 3×3卷积 + channel-wise softmax
+        ## IMPORTANT: 共有D个CP，所以对P做3×3卷积转为D个channel再做channel-wise softmax，作用是感知P的每个location对每个CP的attention/weight是多少
+        soft_assign = self.netup(x) # (N, D, w, h)
+        soft_assign = F.softmax(soft_assign, dim=1) # (N, D, w, h)
+        soft_assign = soft_assign.view(soft_assign.shape[0], soft_assign.shape[1], -1) # (N, D, w*h)
 
-        residual = x1 - x2
-        residual = residual * soft_assign.unsqueeze(2)
-        up = residual.sum(dim=-1)
+        
+        ## residual
+        x_flatten = x.view(N, C, -1) # P: (N, C, w, h) => (N, C, w*h)
+        # 把P拷贝D份
+        x1 = x_flatten.expand(self.num_cluster, -1, -1, -1).permute(1, 0, 2, 3) # P: (N, C, w*h) => (D, N, C, w*h) => (N, D, C, w*h)
+        # 把CP拷贝w*h份
+        x2 = centroid.expand(x_flatten.size(-1), -1, -1).permute(1, 2, 0).unsqueeze(0) # CP: (D, C) => (w*h, D, C) => (D, C, w*h)
+        # IMPORTANT：共有D个CP，对于每个CP，P的每个location都要减去它
+        residual = x1 - x2 # (N, D, C, w*h) - (D, C, w*h) => (N, D, C, w*h)
+        residual = residual * soft_assign.unsqueeze(2) # 加权(每个location对每个CP的weight): (N, D, C, w*h) * (N, D, 1, w*h) => (N, D, C, w*h)
+        up = residual.sum(dim=-1) # sum（这张图片所有location对每个CP的weight）(N, D, C, w*h) => (N, D, C)
+
 
         up = F.normalize(up, p=2, dim=2)
-        up = up.view(x.size(0), -1)
+        up = up.view(x.size(0), -1) # (N, D, C) => (N, D*C)
         up = F.normalize(up, p=2, dim=1)
 
-        up = self.upfc(up)
+
+        ## FC
+        up = self.upfc(up) # (N, D*C) => (N, 2*C)
 
         return up, centroid
 
     def forward(self, x, proposals=None, center=None):
+        ## IMPORTANT: ROIBoxHead会调用该函数
         if proposals is not None:
-            xs = self.pooler(x, proposals)
+            ## RoIALign，得到P
+            xs = self.pooler(x, proposals) # P: (N, C, w, h) w==h==s
 
-            up, centroid = self.UP(xs, center)
 
-            x = xs.view(xs.size(0), -1)
-            xc = F.relu(self.fc6c(x))
-            xcm = self.fc7c(xc)
-            xc = torch.cat((xcm, up), dim=1)
+            ##################################################################################
+            ## 使用UP(会转成conditional prototype)对P进行增强
+            up, centroid = self.UP(xs, center) # (N, 2*C)   (D, C)
 
-            xr = F.relu(self.fc6r(x))
-            xr = F.relu(self.fc7r(xr))
+            ## 对P进行FC，得到用于回归和分类的feature
+            x = xs.view(xs.size(0), -1) # P: (N, C, w, h) => (N, C*w*h)
+            
+            xc = F.relu(self.fc6c(x)) # P: (N, C*w*h) => (N, 2*C)
+            xcm = self.fc7c(xc) # P: (N, 2*C) => (N, 2*C)
+            ## 将P和enhanced P在channel维度上拼接
+            xc = torch.cat((xcm, up), dim=1) # (N, 2*C) => (N, 4*C)
 
-            aug = self.encode(xs.view(xs.shape[0], xs.shape[1], -1))
-            new_center = self.encode(centroid.unsqueeze(0).repeat(xs.shape[0], 1, 1).permute(0,2,1)).permute(0,2,1)
-            align = F.softmax(torch.matmul(new_center, aug), dim=1)
 
-            aug_feature = torch.matmul(new_center.permute(0,2,1), align)
-            aug = torch.cat((aug, aug_feature), dim=1)
-            aug = F.relu(self.transform(aug) + xs.view(xs.shape[0], xs.shape[1], -1))
-            x = aug.view(xs.size(0), -1)
-            xc1 = F.relu(self.fc6c(x))
-            xc1 = self.fc7c(xc1)
-            xcm1 = torch.cat((xc1, xcm), dim=1)
+            ## 对P进行FC: (N, C*w*h) => (N, representation_size)
+            xr = F.relu(self.fc6r(x)) # P: (N, C*w*h) => (N, representation_size)
+            xr = F.relu(self.fc7r(xr)) # P: (N, representation_size) => (N, representation_size)
+
+
+
+
+
+            ##################################################################################
+            #### enhance
+            ## 对P进行1×1卷积，映射到1个embedding space
+            aug = self.encode(xs.view(xs.shape[0], xs.shape[1], -1)) # (N, C, w, h) => (N, C, w*h) => (N, C, w*h)
+            ## 对CP进行FC，映射到1个embedding space
+            new_center = self.encode(centroid.unsqueeze(0).repeat(xs.shape[0], 1, 1).permute(0,2,1)).permute(0,2,1) # CP: (D, C) => (1, D, C) => (N, D, C) => (N, C, D) => 1×1卷积 => (N, D, C)
+            ## 将aug与new_center相乘，然后softamx，得到align
+            align = F.softmax(torch.matmul(new_center, aug), dim=1) # (N, C, w*h) × (N, D, C) => (N, D, w*h)
+            ## 将align和new_center相乘，得到aug_feature
+            aug_feature = torch.matmul(new_center.permute(0,2,1), align) # (N, C, D) × (N, D, w*h) => (N, C, w*h)
+            ## 将aug和aug_feature拼接起来
+            aug = torch.cat((aug, aug_feature), dim=1) # (N, 2*C, w*h)
+            ## 对aug进行transformation，即(1×1卷积+ReLU) * 2；然后再和P相加；再ReLU
+            aug = F.relu(self.transform(aug) + xs.view(xs.shape[0], xs.shape[1], -1)) # (N, C, w*h)
+            ## reshape: 新的enhanced P
+            x = aug.view(xs.size(0), -1) # (N, C, w*h) => (N, C*w*h)
+
+
+            ### 下面3步和上面对P进行FC的操作类似，得到用于分类的feature
+            xc1 = F.relu(self.fc6c(x)) # (N, C*w*h) => (N, 2*C)  注: fc6c上面也用过
+            xc1 = self.fc7c(xc1) # (N, 2*C) => (N, 2*C)  注: fc7c上面也用过
+            ## 将P和新的enhanced P在channel维度上拼接
+            xcm1 = torch.cat((xc1, xcm), dim=1) # (N, 2*C) => (N, 4*C)
+            
+            ## 三者分别是classifier1用的feature、classifier2用的feature、regressor用的feature
             return xc, xcm1, xr
         else:
             features = []
